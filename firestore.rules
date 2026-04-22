@@ -1,0 +1,193 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ------------------------------------------------------------------------
+    // 1. GLOBAL PRIMITIVES & HELPERS
+    // ------------------------------------------------------------------------
+    function isValidId(id) { 
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isSignedIn() { return request.auth != null; }
+    function isEmailVerified() { return isSignedIn() && request.auth.token.email_verified == true; }
+    
+    // Auth tokens do not contain roles. Roles are looked up in the 'users' collection.
+    // However, for bootstrapping, we trust a list of admin emails.
+    function isHardcodedAdmin() {
+      return isEmailVerified() && request.auth.token.email in [
+        "aikennavas@gmail.com", 
+        "vantoniomolina@gmail.com", 
+        "admin@cantv.com.ve", 
+        "asistente@cantv.com.ve"
+      ];
+    }
+
+    function getUserRole() {
+      let profile = get(/databases/$(database)/documents/users/$(request.auth.uid));
+      return (profile != null) ? profile.data.role : null;
+    }
+
+    function isAdmin() {
+      return isHardcodedAdmin() || (isEmailVerified() && getUserRole() == 'admin');
+    }
+
+    // ------------------------------------------------------------------------
+    // 2. GLOBAL SAFETY NET
+    // ------------------------------------------------------------------------
+    match /{document=**} { 
+      allow read, write: if false; 
+    }
+
+    // ------------------------------------------------------------------------
+    // 3. USERS COLLECTION (PII)
+    // ------------------------------------------------------------------------
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'createdAt']) &&
+             data.keys().size() >= 5 && data.keys().size() <= 6 &&
+             data.uid == request.auth.uid &&
+             data.email is string && data.email.size() <= 200 &&
+             data.displayName is string && data.displayName.size() <= 100 &&
+             data.role in ['admin', 'supervisor', 'tecnico'] &&
+             data.createdAt is timestamp &&
+             (!('department' in data) || data.department is string);
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+      
+      allow create: if isValidId(userId) && request.auth.uid == userId && isValidUserProfile(incoming()) &&
+                    // Self-assigned admin role is blocked unless listed in hardcoded admins
+                    (incoming().role != 'admin' || isHardcodedAdmin());
+                    
+      allow update: if isValidId(userId) && (request.auth.uid == userId || isAdmin()) &&
+                    isValidUserProfile(incoming()) &&
+                    // Identity & Immortals
+                    incoming().uid == existing().uid &&
+                    incoming().createdAt == existing().createdAt &&
+                    // Action based updates
+                    (
+                      isAdmin() || (
+                        request.auth.uid == userId && 
+                        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'department'])
+                      )
+                    );
+      
+      allow delete: if isAdmin() && userId != request.auth.uid;
+    }
+
+    // ------------------------------------------------------------------------
+    // 4. TECHNICIANS COLLECTION
+    // ------------------------------------------------------------------------
+    function isValidTechnician(data) {
+      return data.keys().hasAll(['name', 'employeeId', 'specialty', 'status', 'createdAt']) &&
+             data.keys().size() >= 5 && data.keys().size() <= 10 &&
+             data.name is string && data.name.size() <= 150 &&
+             data.employeeId is string && data.employeeId.size() <= 50 &&
+             data.specialty is string && data.specialty.size() <= 100 &&
+             data.status in ['activo', 'inactivo'] &&
+             data.createdAt is timestamp &&
+             (!('isDeleted' in data) || data.isDeleted is bool) &&
+             (!('deletedAt' in data) || (data.deletedAt is timestamp || data.deletedAt == null));
+    }
+
+    match /technicians/{techId} {
+      allow read: if isValidId(techId) && isEmailVerified();
+      
+      // Only admins can write technicians
+      allow create: if isValidId(techId) && isAdmin() && isValidTechnician(incoming());
+      
+      allow update: if isValidId(techId) && isAdmin() && isValidTechnician(incoming()) &&
+                    incoming().createdAt == existing().createdAt &&
+                    (
+                      // Action: Logical delete
+                      (incoming().isDeleted == true && incoming().diff(existing()).affectedKeys().hasOnly(['isDeleted', 'deletedAt'])) ||
+                      // Action: General Edit
+                      (incoming().diff(existing()).affectedKeys().hasAll(['name', 'employeeId', 'specialty', 'status']))
+                    );
+                    
+      allow delete: if isAdmin();
+    }
+
+    // ------------------------------------------------------------------------
+    // 5. ACTIVITIES COLLECTION
+    // ------------------------------------------------------------------------
+    function isValidActivity(data) {
+      return data.keys().hasAll(['title', 'description', 'type', 'hasPerDiem', 'technicianId', 'technicianName', 'date', 'createdAt']) &&
+             data.keys().size() >= 8 && data.keys().size() <= 25 &&
+             data.title is string && data.title.size() <= 200 &&
+             data.description is string && data.description.size() <= 2000 &&
+             data.type in ['provisión', 'transmisión', 'datos', 'otro'] &&
+             data.hasPerDiem is bool &&
+             data.technicianId is string &&
+             data.technicianName is string &&
+             data.date is timestamp &&
+             data.createdAt is timestamp &&
+             (!('incidentNumber' in data) || data.incidentNumber is string) &&
+             (!('fleet' in data) || data.fleet is string) &&
+             (!('startTime' in data) || data.startTime is string) &&
+             (!('endTime' in data) || data.endTime is string) &&
+             (!('overtimeHours' in data) || data.overtimeHours is number) &&
+             (!('perDiemAmount' in data) || data.perDiemAmount is number) &&
+             (!('participants' in data) || (data.participants is list && data.participants.size() <= 20)) &&
+             (!('isDeleted' in data) || data.isDeleted is bool) &&
+             (!('deletedAt' in data) || (data.deletedAt is timestamp || data.deletedAt == null)) &&
+             (!('adminId' in data) || data.adminId is string);
+    }
+
+    match /activities/{activityId} {
+      allow read: if isValidId(activityId) && isEmailVerified();
+      
+      allow create: if isValidId(activityId) && isAdmin() && isValidActivity(incoming()) &&
+                    incoming().createdAt == request.time;
+      
+      allow update: if isValidId(activityId) && isAdmin() && isValidActivity(incoming()) &&
+                    incoming().createdAt == existing().createdAt &&
+                    (
+                      // Action: Logical delete
+                      (incoming().isDeleted == true && incoming().diff(existing()).affectedKeys().hasOnly(['isDeleted', 'deletedAt'])) ||
+                      // Action: Edit
+                      (incoming().diff(existing()).affectedKeys().hasAny(['title', 'description', 'type', 'date']))
+                    );
+                    
+      allow delete: if isAdmin();
+    }
+
+    // ------------------------------------------------------------------------
+    // 6. NOTIFICATIONS COLLECTION
+    // ------------------------------------------------------------------------
+    function isValidNotification(data) {
+      return data.keys().hasAll(['userId', 'userName', 'type', 'message', 'createdAt', 'readBy']) &&
+             data.keys().size() >= 6 && data.keys().size() <= 10 &&
+             data.userId is string &&
+             data.userName is string &&
+             data.type is string &&
+             data.message is string &&
+             data.message.size() <= 500 &&
+             data.createdAt is timestamp &&
+             data.readBy is list && data.readBy.size() <= 50;
+    }
+
+    match /notifications/{notifId} {
+      allow get: if isValidId(notifId) && isEmailVerified() && existing().userId == request.auth.uid;
+      allow list: if isEmailVerified() && resource.data.userId == request.auth.uid;
+      
+      allow create: if isValidId(notifId) && isEmailVerified() && isValidNotification(incoming());
+      
+      allow update: if isValidId(notifId) && isEmailVerified() && 
+                    existing().userId == request.auth.uid &&
+                    incoming().diff(existing()).affectedKeys().hasOnly(['readBy']) &&
+                    incoming().readBy.size() > existing().readBy.size();
+                    
+      allow delete: if isAdmin();
+    }
+
+    // ------------------------------------------------------------------------
+    // 7. TEST CONNECTION
+    // ------------------------------------------------------------------------
+    match /test/connection {
+      allow read: if true;
+    }
+  }
+}
